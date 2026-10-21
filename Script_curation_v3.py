@@ -1,0 +1,513 @@
+!pip install langdetect
+
+import re
+import requests
+import time
+import json
+import datetime
+
+
+# ============================================================================
+# CONFIGURATION — à modifier une fois selon votre usage
+# ============================================================================
+
+COLLECTION = "UNIV-PARIS1"   # Code de collection HAL
+
+# ============================================================================
+# DICTIONNAIRE DES TYPES DE DOCUMENTS + EMOJIS LANGUES
+# ============================================================================
+
+DOCTYPE_LABELS = {
+    'ART': 'Article',
+    'COUV': 'Chapitre',
+    'OUV': 'Ouvrage',
+    'NOTICE': 'Notice de dictionnaire',
+    'COMM': 'Communication',
+    'UNDEFINED': 'Working Paper',
+    'IMG': 'Image',
+    'THESE': 'Thèse',
+    'HDR': 'HDR',
+    'POSTER': 'Poster',
+    'REPORT': 'Rapport',
+}
+
+LANG_FLAGS = {
+    'fr': '🇫🇷​',
+    'en': '🇬🇧',
+    'de': '🇩🇪',
+    'es': '🇪🇸',
+    'it': '🇮🇹',
+    'pt': '🇵🇹',
+    'nl': '🇳🇱',
+    'ru': '🇷🇺',
+    'zh': '🇨🇳',
+    'ja': '🇯🇵',
+    'ar': '🇸🇦',
+}
+
+
+# ============================================================================
+# PARTIE 1A : RÉCUPÉRATION DIRECTE DEPUIS L'API HAL PAR DATE
+# ============================================================================
+
+def fetch_notices_by_date(date_from, date_to, collection=COLLECTION):
+    """
+    Récupère toutes les notices soumises depuis date_from (datetime.date)
+    dans la collection donnée.
+    """
+    date_str_from = date_from.strftime("%Y-%m-%dT00:00:00Z")
+    date_str_to   = date_to.strftime("%Y-%m-%dT23:59:59Z")
+    query = f"releasedDate_tdate:[{date_str_from} TO {date_str_to}]"
+    fq = f"collCode_s:{collection}"
+
+    notices = []
+    rows = 100
+    start = 0
+
+    print(f"🔍 Récupération des notices soumises depuis le {date_from.strftime('%d/%m/%Y')} dans la collection {collection}...\n")
+
+    while True:
+        url = (
+            f"https://api.archives-ouvertes.fr/search"
+            f"?q={requests.utils.quote(query)}"
+            f"&fq={requests.utils.quote(fq)}"
+            f"&fl=*&wt=json&rows={rows}&start={start}"
+        )
+
+        try:
+            response = requests.get(url, timeout=15)
+            response.raise_for_status()
+            data = response.json()
+        except Exception as e:
+            print(f"⚠️  Erreur lors de la récupération : {e}")
+            break
+
+        docs = data.get('response', {}).get('docs', [])
+        total = data.get('response', {}).get('numFound', 0)
+
+        if start == 0:
+            print(f"📋 {total} notice(s) trouvée(s)\n")
+
+        for doc in docs:
+            hal_id = doc.get('halId_s', '')
+            notices.append({
+                'numero': str(len(notices) + 1),
+                'hal_id': hal_id,
+                'docid': str(doc.get('docid', '')),
+                'url': f"https://hal.science/{hal_id}",
+                'raw': '',
+                '_prefetched_metadata': doc   # métadonnées déjà disponibles
+            })
+
+        start += rows
+        if start >= total:
+            break
+
+        time.sleep(0.2)
+
+    return notices
+
+
+# ============================================================================
+# PARTIE 1B : EXTRACTION DES NOTICES DEPUIS UN FICHIER TEXTE
+# ============================================================================
+
+def extract_notices(file_path):
+    """
+    Extrait les notices avec leur numéro, citation et halId depuis le fichier texte
+    """
+    notices = []
+
+    with open(file_path, 'r', encoding='utf-8') as f:
+        content = f.read()
+
+    raw_notices = content.split('-----------------------------------------------------------------------------')
+
+    for raw in raw_notices:
+        if not raw.strip():
+            continue
+
+        num_match = re.search(r'\[# (\d+)\]', raw)
+        num = num_match.group(1) if num_match else None
+
+        halid_match = re.search(r'⟨([a-z]+-\d+(?:v\d+)?)⟩', raw)
+        hal_id = halid_match.group(1) if halid_match else None
+
+        url_match = re.search(r'URL : <a href="(https://[^"]+)">', raw)
+        url = url_match.group(1) if url_match else None
+
+        if hal_id:
+            docid = re.sub(r'^hal[a-z]*-0*', '', hal_id)
+            docid = re.sub(r'v\d+$', '', docid)
+
+            notices.append({
+                'numero': num,
+                'hal_id': hal_id,
+                'docid': docid,
+                'url': url,
+                'raw': raw.strip()
+            })
+
+    return notices
+
+
+# ============================================================================
+# PARTIE 2 : REQUÊTES API HAL
+# ============================================================================
+
+def fetch_docid_from_page(url):
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        match = re.search(r'data-docid="(\d+)"', response.text)
+        if match:
+            return match.group(1)
+        return None
+    except Exception as e:
+        print(f"  ⚠️  Erreur lors de la récupération de la page: {e}")
+        return None
+
+
+def fetch_hal_metadata(notice):
+    """
+    Récupère les métadonnées HAL pour une notice.
+    Si les métadonnées sont déjà pré-chargées (mode date), on les utilise directement.
+    """
+    # Mode "par date" : métadonnées déjà disponibles
+    if notice.get('_prefetched_metadata'):
+        return notice['_prefetched_metadata']
+
+    # Mode "fichier txt" : requête API
+    docid = notice['docid']
+    url_api = f"https://api.archives-ouvertes.fr/search?q=docid:{docid}&fl=*&wt=json"
+
+    try:
+        response = requests.get(url_api, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+
+        if data.get('response', {}).get('numFound', 0) > 0:
+            return data['response']['docs'][0]
+        else:
+            print(f"  ⚠️  DocId calculé ({docid}) non trouvé, tentative via la page HTML...")
+            real_docid = fetch_docid_from_page(notice['url'])
+
+            if real_docid and real_docid != docid:
+                print(f"  ✓ DocId réel trouvé: {real_docid}")
+                url_api_fallback = f"https://api.archives-ouvertes.fr/search?q=docid:{real_docid}&fl=*&wt=json"
+                response2 = requests.get(url_api_fallback, timeout=10)
+                response2.raise_for_status()
+                data2 = response2.json()
+                if data2.get('response', {}).get('numFound', 0) > 0:
+                    return data2['response']['docs'][0]
+
+            return None
+
+    except Exception as e:
+        print(f"  ⚠️  Erreur API: {e}")
+        return None
+
+
+def count_authors_without_affiliation(metadata):
+    if not metadata:
+        return None, None
+
+    all_authors = metadata.get('authIdFormPerson_s', [])
+    struct_with_auth = metadata.get('structHasAlphaAuthId_fs', [])
+
+    authors_with_affiliation = set()
+    for entry in struct_with_auth:
+        match = re.search(r'_JoinSep_([^_]+)_FacetSep_', entry)
+        if match:
+            authors_with_affiliation.add(match.group(1))
+
+    authors_without_affiliation = [a for a in all_authors if a not in authors_with_affiliation]
+
+    return len(authors_without_affiliation), len(all_authors)
+
+
+def analyze_notices(notices):
+    results = []
+
+    for i, notice in enumerate(notices, 1):
+        print(f"[{i}/{len(notices)}] Analyse de {notice['hal_id']}...")
+
+        metadata = fetch_hal_metadata(notice)
+
+        if metadata:
+            results.append({'notice': notice, 'metadata': metadata})
+        else:
+            print(f"  ❌ Notice non trouvée même après fallback")
+            results.append({'notice': notice, 'metadata': None})
+
+        # Pas de pause si métadonnées déjà chargées (mode date)
+        if not notice.get('_prefetched_metadata'):
+            time.sleep(0.3)
+
+    return results
+
+
+def search_duplicates(metadata, hal_id_base):
+    if not metadata:
+        return []
+
+    titles = metadata.get('title_s', [])
+    if not isinstance(titles, list):
+        titles = [titles] if titles else []
+
+    doi = metadata.get('doiId_s')
+    if isinstance(doi, list):
+        doi = doi[0] if doi else None
+
+    qParts = []
+    if doi:
+        qParts.append(f'doiId_s:"{doi}"')
+
+    for title in titles:
+        if title:
+            mots = re.sub(r'[()":!?,;\'\'-]', '', title)
+            mots = ' '.join(mots.split()[:12])
+            if mots:
+                qParts.append(f'title_t:({mots})')
+
+    if not qParts:
+        return []
+
+    query = ' OR '.join(qParts)
+    url = f"https://api.archives-ouvertes.fr/search?q={requests.utils.quote(query)}&fl=halId_s,title_s,doiId_s&wt=json&rows=50"
+
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+
+        if not data.get('response', {}).get('docs'):
+            return []
+
+        duplicates = []
+        for doc in data['response']['docs']:
+            doc_halid = doc.get('halId_s', '')
+            doc_halid_base = re.sub(r'v\d+$', '', doc_halid)
+            doc_doi = doc.get('doiId_s')
+            if isinstance(doc_doi, list):
+                doc_doi = doc_doi[0] if doc_doi else None
+
+            if doc_halid_base == hal_id_base:
+                continue
+            if doi and doc_doi and doc_doi != doi:
+                continue
+
+            duplicates.append({
+                'halId': doc_halid,
+                'title': doc.get('title_s', [''])[0] if isinstance(doc.get('title_s'), list) else doc.get('title_s', ''),
+                'doi': doc_doi
+            })
+
+        return duplicates
+
+    except Exception as e:
+        print(f"  ⚠️  Erreur recherche doublons: {e}")
+        return []
+
+
+# ============================================================================
+# PARTIE 3 : FLAGGING ET ANALYSE
+# ============================================================================
+
+def flag_notice(metadata, notice):
+    if not metadata:
+        return ['❌ Notice non trouvée dans l\'API'], {'doc_type': 'UNKNOWN'}
+
+    flags = []
+    info = {}
+
+    doc_type = metadata.get('docType_s', 'UNKNOWN')
+    doc_type_label = DOCTYPE_LABELS.get(doc_type, doc_type)
+    info['doc_type'] = doc_type_label
+    doc_type_code = doc_type
+
+    if doc_type_code == 'ART':
+        doi = metadata.get('doiId_s')
+        in_press = metadata.get('inPress_bool', False)
+        domains = metadata.get('domain_s', [])
+        journal = metadata.get('journalTitle_s', [])
+
+        is_law = False
+        if isinstance(domains, list):
+            is_law = any('shs.droit' in domain for domain in domains)
+        elif isinstance(domains, str):
+            is_law = 'shs.droit' in domains
+
+        info['doi'] = doi if doi else 'ABSENT'
+
+        if not doi and not in_press and not is_law:
+            flags.append(f"⚠️ Article sans DOI ({journal if journal else 'Journal inconnu'})")
+        if doi and not metadata.get('abstract_s'):
+            flags.append('⚠️ Article sans résumé (DOI disponible)')
+
+    if doc_type_code == 'COUV':
+        scientific_editor = metadata.get('scientificEditor_s')
+        if scientific_editor:
+            editor_text = scientific_editor
+            if isinstance(editor_text, list):
+                editor_text = ', '.join(editor_text)
+            flags.append(f'✒️  Éditeur scientifique: {editor_text}')
+        else:
+            flags.append('❌ Éditeur scientifique absent')
+
+    journal_valid = metadata.get('journalValid_s')
+    if journal_valid == 'INCOMING':
+        flags.append('⚠️ Revue invalide (INCOMING)')
+
+    nb_without, total = count_authors_without_affiliation(metadata)
+    if nb_without and nb_without > 0:
+        flags.append(f'⚠️ {nb_without} auteur(s) sans affiliation sur {total}')
+
+    hal_id_base = re.sub(r'v\d+$', '', notice['hal_id'])
+    duplicates = search_duplicates(metadata, hal_id_base)
+
+    display_title = ""
+    titles_from_metadata = metadata.get('title_s')
+    if isinstance(titles_from_metadata, list) and titles_from_metadata:
+        display_title = titles_from_metadata[0]
+    elif isinstance(titles_from_metadata, str):
+        display_title = titles_from_metadata
+
+    if duplicates:
+        info['titre_notice'] = display_title
+        flags.append(f'⚠️ {len(duplicates)} doublon(s) potentiel(s)')
+
+    from langdetect import detect, LangDetectException
+
+    declared_lang = metadata.get('language_s')  # ex: 'fr', 'en'
+    if isinstance(declared_lang, list):
+        declared_lang = declared_lang[0] if declared_lang else None
+    title = metadata.get('title_s')
+    if isinstance(title, list):
+        title = title[0] if title else None
+
+    if declared_lang and title and len(title) > 20:  # titre trop court = détection peu fiable
+        try:
+            detected = detect(title)
+            if detected != declared_lang:
+                declared_flag = LANG_FLAGS.get(declared_lang, declared_lang)
+                detected_flag = LANG_FLAGS.get(detected, detected)
+                flags.append(f'⚠️ Langue suspecte : déclarée {declared_flag}, titre détecté {detected_flag}')
+        except LangDetectException:
+            pass
+
+    return flags, info
+
+
+def generate_report(results):
+    print("\n" + "="*80)
+    print("RAPPORT D'ANALYSE DES NOTICES HAL")
+    print("="*80 + "\n")
+
+    for result in results:
+        notice = result['notice']
+        metadata = result['metadata']
+
+        flags, info = flag_notice(metadata, notice)
+
+        print(f"{'─'*80}")
+        print(f"[#{notice['numero']}] {notice['hal_id']} - {info.get('doc_type', 'UNKNOWN')}")
+
+        if metadata:
+            title = metadata.get('title_s')
+            if title:
+                if isinstance(title, list):
+                    title = title[0]
+                print(f"📄 {title}")
+
+        if flags:
+            for flag in flags:
+                print(f"   {flag}")
+        else:
+            print(f"   ✅ Aucun problème détecté")
+
+        print(f"   🔗 {notice['url']}")
+        print()
+
+
+# ============================================================================
+# PARTIE 4 : INTERFACE COLAB
+# ============================================================================
+
+if __name__ == "__main__":
+    import ipywidgets as widgets
+    from IPython.display import display, clear_output
+    from google.colab import files
+
+    hier = datetime.date.today() - datetime.timedelta(days=1)
+
+    # --- Widgets ---
+    mode = widgets.ToggleButtons(
+        options=['📅 Par date (API HAL)', '📁 Upload fichiers TXT'],
+        description='Mode :',
+        style={'description_width': 'initial'},
+        layout=widgets.Layout(margin='10px 0')
+    )
+
+    date_picker = widgets.DatePicker(
+        description='Depuis le :',
+        value=hier,
+        style={'description_width': 'initial'},
+        layout=widgets.Layout(width='250px')
+    )
+
+    date_end = widgets.DatePicker(
+        description='Jusqu\'au :',
+        value=datetime.date.today(),
+        style={'description_width': 'initial'},
+        layout=widgets.Layout(width='250px')
+    )
+
+    btn_lancer = widgets.Button(
+        description='▶  Lancer l\'analyse',
+        button_style='primary',
+        layout=widgets.Layout(margin='10px 0', width='200px')
+    )
+
+    output = widgets.Output()
+
+    # Afficher/masquer le date picker selon le mode
+    def on_mode_change(change):
+        vis = 'visible' if change['new'] == '📅 Par date (API HAL)' else 'hidden'
+        date_picker.layout.visibility = vis
+        date_end.layout.visibility = vis
+
+    mode.observe(on_mode_change, names='value')
+
+    def on_lancer(b):
+        with output:
+            clear_output()
+            notices = [] # Initialize notices list
+            if mode.value == '📅 Par date (API HAL)':
+                if not date_picker.value or not date_end.value:
+                    print("⚠️  Veuillez sélectionner une date de début et de fin.")
+                    return
+                notices = fetch_notices_by_date(date_picker.value, date_end.value, collection=COLLECTION)
+                if not notices:
+                    print("ℹ️  Aucune notice trouvée pour cette période.")
+                    return
+            else: # mode.value == '📁 Upload fichiers TXT'
+                print("📤 Veuillez uploader vos fichiers TXT...")
+                uploaded = files.upload()
+                for filename in uploaded.keys():
+                    print(f"\n📄 Traitement de {filename}...")
+                    n = extract_notices(filename)
+                    notices.extend(n)
+                    print(f"  ✅ {len(n)} notices extraites")
+                print(f"\n📋 TOTAL : {len(notices)} notices à analyser\n")
+                if not notices:
+                    print("ℹ️  Aucune notice extraite des fichiers uploadés.")
+                    return
+
+            print("🔍 Analyse en cours...\n")
+            results = analyze_notices(notices)
+            generate_report(results)
+
+    btn_lancer.on_click(on_lancer)
+
+    display(mode, date_picker, date_end, btn_lancer, output)
