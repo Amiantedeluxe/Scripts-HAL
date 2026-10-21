@@ -34,6 +34,9 @@ langdetect
 
 Une interface web est disponible via Streamlit, permettant de lancer l'analyse, visualiser les résultats et exporter un rapport CSV sans passer par le script directement : https://hal-curation.streamlit.app/ 
 
+
+
+
 ## score_interdisciplinarité.py
 
 Script d'analyse bibliométrique qui propose une mesure de degré d'interdisciplinarité des revues dans lesquelles publient les membres d'une structure HAL.
